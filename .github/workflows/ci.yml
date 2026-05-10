@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # build.sh cross-compiles yonderd into cmd/installer/embed/ so
+      # //go:embed has a real file before installer compilation happens
+      # during `go test`.
+      - name: Build (cross-compile + embed)
+        run: ./scripts/build.sh
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...

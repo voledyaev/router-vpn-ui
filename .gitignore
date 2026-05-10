@@ -1,0 +1,25 @@
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go build artifacts
+/yonder
+/yonder-*
+/yonderd
+/yonderd-*
+*.test
+*.out
+
+# Embed slot — router-app binary placed here by scripts/build.sh before installer build
+/cmd/installer/embed/yonderd*
+
+# Local-only test artifacts
+/tmp/
+/scratch/
+
+# Captured router data (may contain secrets)
+/local-state/
+*.local.json

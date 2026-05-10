@@ -1,0 +1,78 @@
+#!/bin/sh
+# Entware init.d script for yonder.
+# Runs the yonderd binary on port 8080 as a background daemon.
+
+PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/sbin:/bin:/usr/sbin:/usr/bin
+DESC="yonder"
+BIN=/opt/yonder/yonderd
+PIDFILE=/var/run/yonder.pid
+DATA_DIR=/opt/yonder/data
+LOGFILE=$DATA_DIR/yonderd.log
+
+export RVU_BASE_DIR=$DATA_DIR
+export RVU_LISTEN=:8080
+export RVU_XRAY_CONFIGS_DIR=/opt/etc/xray/configs
+
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+start() {
+    if is_running; then
+        echo "$DESC already running (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    mkdir -p "$DATA_DIR"
+    echo "Starting $DESC"
+    # Detach: stdin from /dev/null, stdout/stderr to log, background.
+    # busybox ash on Entware has no nohup; this is the equivalent.
+    "$BIN" </dev/null >>"$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 1
+    if is_running; then
+        echo "  started (pid $(cat "$PIDFILE"))"
+    else
+        echo "  failed; see $LOGFILE"
+        return 1
+    fi
+}
+
+stop() {
+    if is_running; then
+        PID=$(cat "$PIDFILE")
+        echo "Stopping $DESC (pid $PID)"
+        kill "$PID" 2>/dev/null
+        i=0
+        while is_running && [ $i -lt 10 ]; do
+            sleep 1
+            i=$((i+1))
+        done
+        is_running && kill -9 "$PID" 2>/dev/null
+    fi
+    rm -f "$PIDFILE"
+}
+
+restart() {
+    stop
+    start
+}
+
+status() {
+    if is_running; then
+        echo "$DESC is running (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    echo "$DESC is not running"
+    return 1
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) restart ;;
+    status)  status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

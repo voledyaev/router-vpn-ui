@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write  # needed by softprops/action-gh-release to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build yonderd (linux/arm64) and embed
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          mkdir -p cmd/installer/embed
+          go build -trimpath -ldflags="-s -w" \
+              -o cmd/installer/embed/yonderd-linux-arm64 \
+              ./cmd/router-app
+
+      - name: Run tests
+        run: go test -count=1 ./...
+
+      - name: Build installer (darwin/arm64)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+              -o yonder-darwin-arm64 \
+              ./cmd/installer
+          ls -lh yonder-darwin-arm64
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: yonder-darwin-arm64
+          generate_release_notes: true

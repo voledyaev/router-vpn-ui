@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>yonder</title>
+    <link rel="stylesheet" href="/style.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body x-data="vpnui()" x-cloak>
+
+<main class="container">
+
+    <!-- Header -->
+    <header>
+        <h1>yonder</h1>
+        <div class="status" x-show="state">
+            <template x-if="!state || !state.servers || state.servers.length === 0">
+                <span class="badge badge--neutral">setup needed</span>
+            </template>
+            <template x-if="state && state.servers && state.servers.length > 0">
+                <span :class="state.vpn_on ? 'badge badge--on' : 'badge badge--off'"
+                      x-text="state.vpn_on ? 'on' : 'off'"></span>
+            </template>
+        </div>
+    </header>
+
+    <!-- Loading shimmer until first state load -->
+    <template x-if="!state">
+        <div class="card muted">loading…</div>
+    </template>
+
+    <!-- Onboarding: no subscription yet -->
+    <template x-if="state && (!state.servers || state.servers.length === 0)">
+        <section class="card">
+            <h2>Get started</h2>
+            <p class="muted">Paste your VLESS subscription URL. The router fetches it and lists the available country/server endpoints.</p>
+            <form @submit.prevent="submitSubscription()">
+                <label>
+                    Subscription URL
+                    <input type="url" x-model="subscriptionUrl"
+                           placeholder="https://provider.example/sub/UUID"
+                           required>
+                </label>
+                <label>
+                    Routing rules URL <span class="muted">(optional)</span>
+                    <input type="url" x-model="rulesUrl"
+                           placeholder="https://gist.github.com/.../rules.json">
+                    <small class="muted">JSON in Xray's native routing format (<code>{"routing": {"rules": [...]}}</code> or just <code>[...]</code>). Each rule needs <code>outboundTag</code> = <code>direct</code>/<code>proxy</code>/<code>block</code>. Leave empty for the bundled default (everything through VPN, only local networks direct).</small>
+                </label>
+                <button type="submit" :disabled="busy">
+                    <span x-show="!busy">Connect</span>
+                    <span x-show="busy">Fetching…</span>
+                </button>
+                <div class="error" x-show="error" x-text="error"></div>
+            </form>
+        </section>
+    </template>
+
+    <!-- Main: subscription configured -->
+    <template x-if="state && state.servers && state.servers.length > 0">
+        <div>
+
+            <!-- VPN toggle -->
+            <section class="card">
+                <div class="row">
+                    <div>
+                        <h2 style="margin: 0">VPN</h2>
+                        <small class="muted" x-show="!state.active_server_id">no server selected</small>
+                        <small class="muted" x-show="state.active_server_id">
+                            via <strong x-text="activeServerName"></strong>
+                        </small>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" :checked="state.vpn_on"
+                               :disabled="busy || (!state.active_server_id && !state.vpn_on)"
+                               @change="toggleVpn($event.target.checked)">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </section>
+
+            <!-- Server picker -->
+            <section class="card">
+                <h2>Server</h2>
+                <div class="server-grid">
+                    <template x-for="srv in state.servers" :key="srv.id">
+                        <button type="button"
+                                class="server"
+                                :class="{ 'server--active': srv.id === state.active_server_id }"
+                                :disabled="busy"
+                                @click="pickServer(srv.id)">
+                            <span class="server__country" x-text="srv.country"></span>
+                            <span class="server__name" x-text="srv.name"></span>
+                            <span class="server__host muted" x-text="srv.host"></span>
+                        </button>
+                    </template>
+                </div>
+            </section>
+
+            <!-- Subscription / rules / advanced -->
+            <section class="card">
+                <h2>Configuration</h2>
+                <dl class="kv">
+                    <dt>Subscription</dt>
+                    <dd>
+                        <code class="break" x-text="state.subscription_url"></code>
+                        <small class="muted">last fetched <span x-text="fmtTime(state.subscription_fetched_at)"></span></small>
+                        <div class="actions">
+                            <button type="button" class="btn-secondary" :disabled="busy" @click="refreshSubscription()">Refresh subscription</button>
+                            <button type="button" class="btn-secondary" :disabled="busy" @click="resetSubscription()">Replace…</button>
+                        </div>
+                    </dd>
+
+                    <dt>Routing rules</dt>
+                    <dd>
+                        <template x-if="state.rules_url">
+                            <div>
+                                <code class="break" x-text="state.rules_url"></code>
+                                <small class="muted">last fetched <span x-text="fmtTime(state.rules_fetched_at)"></span></small>
+                                <div class="actions">
+                                    <button type="button" class="btn-secondary" :disabled="busy" @click="refreshRules()">Refresh rules</button>
+                                    <button type="button" class="btn-secondary" :disabled="busy" @click="setRulesUrl(null)">Reset to default</button>
+                                </div>
+                            </div>
+                        </template>
+                        <template x-if="!state.rules_url">
+                            <div>
+                                <small class="muted">Using bundled default: everything through VPN, only local networks direct. Set a custom URL (Xray-format JSON) to override.</small>
+                                <form @submit.prevent="setRulesUrl(newRulesUrl); newRulesUrl = ''" class="actions">
+                                    <input type="url" x-model="newRulesUrl"
+                                           placeholder="https://gist.github.com/.../rules.json"
+                                           style="flex: 1; min-width: 200px;">
+                                    <button type="submit" class="btn-secondary" :disabled="busy || !newRulesUrl">Set rules URL</button>
+                                </form>
+                            </div>
+                        </template>
+                    </dd>
+                </dl>
+
+                <div class="error" x-show="error" x-text="error"></div>
+                <div class="success" x-show="lastAction" x-text="lastAction"></div>
+            </section>
+
+        </div>
+    </template>
+
+    <footer class="muted">
+        <small>
+            <a href="/api/state" target="_blank">/api/state</a>
+            ·
+            <a href="https://github.com/voledyaev/yonder" target="_blank">github</a>
+        </small>
+    </footer>
+
+</main>
+
+<script src="/app.js"></script>
+
+</body>
+</html>
