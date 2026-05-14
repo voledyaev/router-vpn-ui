@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -19,7 +20,11 @@ import (
 	"github.com/voledyaev/yonder/internal/xray"
 )
 
-const userAgent = "yonder/0.2"
+const (
+	userAgent       = "yonder/0.2"
+	maxLabelLen     = 100
+	maxSourceLen    = 4096
+)
 
 // Handler is the request handler set. One instance is shared across all
 // requests and is safe for concurrent use because each method either
@@ -42,7 +47,15 @@ type Handler struct {
 func (h *Handler) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/state", h.getState)
 	mux.HandleFunc("GET /api/health", h.getHealth)
-	mux.HandleFunc("POST /api/subscription", h.postSubscription)
+
+	// Subscription CRUD. Each subscription appears as its own card in the
+	// UI; servers from all subscriptions feed into the same active-server
+	// pool, addressed by composite (subscription_id, server_id).
+	mux.HandleFunc("POST /api/subscriptions", h.postAddSubscription)
+	mux.HandleFunc("DELETE /api/subscriptions/{id}", h.deleteSubscription)
+	mux.HandleFunc("POST /api/subscriptions/{id}/refresh", h.refreshSubscription)
+	mux.HandleFunc("PATCH /api/subscriptions/{id}", h.patchSubscription)
+
 	mux.HandleFunc("POST /api/server", h.postServer)
 	mux.HandleFunc("POST /api/toggle", h.postToggle)
 	mux.HandleFunc("POST /api/rules-url", h.postRulesURL)
@@ -110,32 +123,40 @@ func (h *Handler) unknownAPI(w http.ResponseWriter, _ *http.Request) {
 	writeError(w, http.StatusNotFound, "unknown endpoint")
 }
 
-// --- API: subscription ---------------------------------------------------
+// --- API: subscriptions --------------------------------------------------
 
-type subscriptionReq struct {
-	URL string `json:"url"`
+type addSubscriptionReq struct {
+	Label  string `json:"label"`
+	Source string `json:"source"`
 }
 
-func (h *Handler) postSubscription(w http.ResponseWriter, r *http.Request) {
-	var req subscriptionReq
+func (h *Handler) postAddSubscription(w http.ResponseWriter, r *http.Request) {
+	var req addSubscriptionReq
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	url := strings.TrimSpace(req.URL)
-	if url == "" {
-		writeError(w, http.StatusBadRequest, "missing 'url'")
+	label := strings.TrimSpace(req.Label)
+	source := strings.TrimSpace(req.Source)
+	if err := validateLabelLength(label); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if err := validateSource(source); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if label == "" {
+		label = deriveLabel(source)
 	}
 
-	raw, err := h.fetchURL(url)
+	servers, err := h.fetchAndParseSubscription(source)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("subscription fetch failed: %v", err))
-		return
-	}
-	servers, err := vless.ParseSubscription(raw)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("subscription parse failed: %v", err))
+		code := http.StatusBadRequest
+		if errors.Is(err, errFetchFailed) {
+			code = http.StatusBadGateway
+		}
+		writeError(w, code, err.Error())
 		return
 	}
 	if len(servers) == 0 {
@@ -143,29 +164,125 @@ func (h *Handler) postSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prevSnap := h.state.Snapshot()
-	wasOn := prevSnap.VPNOn
-	oldActive := prevSnap.ActiveServerID
-
-	snap, err := h.state.SetServers(servers, url, nowISO())
-	if err != nil {
+	if _, err := h.state.AddSubscription(label, source, servers); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
 		return
 	}
+	// New subscription doesn't change the active-server selection, but the
+	// next /api/state poll will surface the new card. No apply needed —
+	// xkeen config only changes when active server or rules change.
+	writeJSON(w, http.StatusOK, h.state.Snapshot())
+}
 
-	// If VPN was on and the previously-selected server is gone, fail safe:
-	// turn VPN off so the apply worker stops the proxy on its next tick.
-	if wasOn && oldActive != "" && snap.ActiveServerID == "" {
-		snap, _ = h.state.Update(func(d *state.Data) { d.VPNOn = false })
+func (h *Handler) deleteSubscription(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !h.state.HasSubscription(id) {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("unknown subscription: %q", id))
+		return
+	}
+	prev := h.state.Snapshot()
+	affected := prev.ActiveServer != nil && prev.ActiveServer.SubscriptionID == id
+
+	if _, err := h.state.DeleteSubscription(id); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, h.state.Snapshot())
+	// Only trigger apply when the deletion actually changes runtime state
+	// (i.e. the active server vanished). Pure list edits don't need xkeen.
+	if affected {
 		h.requestApply()
 	}
-	writeJSON(w, http.StatusOK, snap)
+}
+
+func (h *Handler) refreshSubscription(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !h.state.HasSubscription(id) {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("unknown subscription: %q", id))
+		return
+	}
+	// Find the source for this subscription. Re-fetched on each refresh
+	// (URL) or re-parsed in place (inline vless://).
+	var source string
+	for _, sub := range h.state.Snapshot().Subscriptions {
+		if sub.ID == id {
+			source = sub.Source
+			break
+		}
+	}
+
+	servers, err := h.fetchAndParseSubscription(source)
+	if err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, errFetchFailed) {
+			code = http.StatusBadGateway
+		}
+		writeError(w, code, err.Error())
+		return
+	}
+	if len(servers) == 0 {
+		writeError(w, http.StatusBadRequest, "no usable servers in subscription")
+		return
+	}
+
+	prev := h.state.Snapshot()
+	wasActiveHere := prev.ActiveServer != nil && prev.ActiveServer.SubscriptionID == id
+
+	if _, err := h.state.ReplaceSubscriptionServers(id, servers); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, h.state.Snapshot())
+	// If the active server was inside this subscription, the refresh may
+	// have changed (or removed) it; trigger an apply to reconcile xkeen.
+	if wasActiveHere {
+		h.requestApply()
+	}
+}
+
+type patchSubscriptionReq struct {
+	Label string `json:"label"`
+}
+
+func (h *Handler) patchSubscription(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !h.state.HasSubscription(id) {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("unknown subscription: %q", id))
+		return
+	}
+	var req patchSubscriptionReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	label := strings.TrimSpace(req.Label)
+	if err := validateLabelLength(label); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Empty label = "reset to auto-derived default" — look up the
+	// subscription's source and rebuild.
+	if label == "" {
+		for _, sub := range h.state.Snapshot().Subscriptions {
+			if sub.ID == id {
+				label = deriveLabel(sub.Source)
+				break
+			}
+		}
+	}
+	if _, err := h.state.RenameSubscription(id, label); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, h.state.Snapshot())
 }
 
 // --- API: server selection -----------------------------------------------
 
 type serverReq struct {
-	ID *string `json:"id"` // pointer so null is distinguishable from missing
+	// Both nil → deselect (set active to nil).
+	SubscriptionID *string `json:"subscription_id"`
+	ServerID       *string `json:"server_id"`
 }
 
 func (h *Handler) postServer(w http.ResponseWriter, r *http.Request) {
@@ -174,25 +291,22 @@ func (h *Handler) postServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	snap := h.state.Snapshot()
-	var newID string
-	if req.ID != nil {
-		newID = *req.ID
-	}
-	if newID != "" {
-		known := false
-		for _, s := range snap.Servers {
-			if s.ID == newID {
-				known = true
-				break
-			}
-		}
-		if !known {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown server id: %q", newID))
+
+	var newRef *state.ActiveServerRef
+	if req.SubscriptionID != nil && req.ServerID != nil &&
+		*req.SubscriptionID != "" && *req.ServerID != "" {
+		if !h.state.HasServer(*req.SubscriptionID, *req.ServerID) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"unknown (subscription_id, server_id): (%q, %q)",
+				*req.SubscriptionID, *req.ServerID))
 			return
 		}
+		newRef = &state.ActiveServerRef{
+			SubscriptionID: *req.SubscriptionID,
+			ServerID:       *req.ServerID,
+		}
 	}
-	if _, err := h.state.Update(func(d *state.Data) { d.ActiveServerID = newID }); err != nil {
+	if _, err := h.state.Update(func(d *state.Data) { d.ActiveServer = newRef }); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
 		return
 	}
@@ -306,14 +420,18 @@ func (h *Handler) postRulesRefresh(w http.ResponseWriter, _ *http.Request) {
 // respondAfterApply writes the post-mutation state snapshot immediately,
 // then schedules the proxy regenerate+restart to run asynchronously.
 //
-// Why async: `xkeen -restart` takes up to 90s and re-installs the LAN-side
-// iptables tproxy rules during that window. The mid-flight TCP connection
-// from the browser to /api/toggle can get torn down as a side effect,
-// leaving the UI stuck on a request that never returns. Returning the
-// response before kicking off xkeen avoids the entire window. Failures
-// surface via state.LastError, picked up by the frontend's 10s poll.
+// Why async: `xkeen -restart` takes ~5s normally and during that window
+// the LAN-side iptables tproxy rules get re-installed. Returning the
+// response before kicking off xkeen lets the browser get its ack
+// regardless of how long the apply takes. Failures surface via
+// state.LastError / LastApply, picked up by the frontend's 10s poll.
+//
+// The state.Applying flag is set true here so the response (and any
+// subsequent /api/state poll) tells the UI to disable controls until the
+// worker clears the flag at the end of its iteration.
 func (h *Handler) respondAfterApply(w http.ResponseWriter) {
-	writeJSON(w, http.StatusOK, h.state.Snapshot())
+	snap, _ := h.state.Update(func(d *state.Data) { d.Applying = true })
+	writeJSON(w, http.StatusOK, snap)
 	h.requestApply()
 }
 
@@ -323,20 +441,30 @@ func (h *Handler) respondAfterApply(w http.ResponseWriter) {
 func (h *Handler) requestApply() {
 	select {
 	case h.applyCh <- struct{}{}:
+		h.logger.Println("requestApply: signal queued")
 	default:
+		h.logger.Println("requestApply: signal dropped (channel full or worker stuck)")
 	}
 }
 
 // applyLoop is the single worker that drives xkeen restarts. Runs for the
 // lifetime of the process; caller passes ctx for clean shutdown.
 func (h *Handler) applyLoop(ctx context.Context) {
+	h.logger.Println("applyLoop: started")
+	defer h.logger.Println("applyLoop: exited")
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-h.applyCh:
 			ok, msg := h.regenerateAndRestart()
+			// Always clear Applying at end of iteration. If another signal
+			// is already queued, the next handler call will flip it back
+			// to true before its response is written; UI sees only a brief
+			// false moment between iterations.
 			if _, err := h.state.Update(func(d *state.Data) {
+				d.Applying = false
+				d.LastApply = &state.ApplyResult{At: nowISO(), OK: ok, Msg: msg}
 				if ok {
 					d.LastError = ""
 				} else {
@@ -373,6 +501,33 @@ func (h *Handler) regenerateAndRestart() (bool, string) {
 
 var errFetchFailed = errors.New("fetch failed")
 
+// fetchAndParseSubscription resolves a subscription source to a list of
+// VLESS servers. The source may be:
+//
+//   - an HTTP(S) URL — fetched, then parsed
+//   - a literal `vless://...` URI (or newline-separated list of them) —
+//     parsed in place without any network call
+//
+// validateSource already enforces one of these two shapes; this function
+// just dispatches on the prefix.
+func (h *Handler) fetchAndParseSubscription(source string) ([]vless.Server, error) {
+	var raw []byte
+	if strings.HasPrefix(source, "vless://") {
+		raw = []byte(source)
+	} else {
+		fetched, err := h.fetchURL(source)
+		if err != nil {
+			return nil, err
+		}
+		raw = fetched
+	}
+	servers, err := vless.ParseSubscription(raw)
+	if err != nil {
+		return nil, fmt.Errorf("subscription parse failed: %v", err)
+	}
+	return servers, nil
+}
+
 func (h *Handler) fetchURL(url string) ([]byte, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -404,6 +559,53 @@ func (h *Handler) fetchAndValidateRules(url string) ([]json.RawMessage, error) {
 		return nil, err
 	}
 	return parseXrayRules(raw)
+}
+
+// --- validators ----------------------------------------------------------
+
+// validateLabelLength checks the size cap only — empty labels are accepted
+// at both add-subscription and rename time, and resolved into a derived
+// default via deriveLabel by the caller.
+func validateLabelLength(s string) error {
+	if len(s) > maxLabelLen {
+		return fmt.Errorf("label is too long (max %d chars)", maxLabelLen)
+	}
+	return nil
+}
+
+func validateSource(s string) error {
+	if s == "" {
+		return errors.New("source is required")
+	}
+	if len(s) > maxSourceLen {
+		return fmt.Errorf("source is too long (max %d chars)", maxSourceLen)
+	}
+	switch {
+	case strings.HasPrefix(s, "http://"),
+		strings.HasPrefix(s, "https://"),
+		strings.HasPrefix(s, "vless://"):
+		return nil
+	default:
+		return errors.New("source must start with http://, https://, or vless://")
+	}
+}
+
+// deriveLabel builds a sensible default label from a subscription source.
+// For URLs we use the hostname; for inline vless:// links the embedded host
+// (which is the proxy endpoint, not the link's UUID — safe to display).
+// Always returns a non-empty string.
+func deriveLabel(source string) string {
+	s := strings.TrimSpace(source)
+	if strings.HasPrefix(s, "vless://") {
+		if srv, err := vless.ParseLink(s); err == nil && srv.Host != "" {
+			return srv.Host
+		}
+		return "vless link"
+	}
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return "Subscription"
 }
 
 func nowISO() string {

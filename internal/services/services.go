@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -20,7 +19,9 @@ import (
 const XKeenBin = "/opt/sbin/xkeen"
 
 // xkeen -start/-restart can take a while: it sets up iptables, may load
-// kernel modules on the first run, and waits for xray to come up.
+// kernel modules on first run, and may do a synchronous probe of the
+// configured proxy server. 90s is the budget after which we assume xkeen
+// has hung and kill it.
 const xkeenTimeout = 90 * time.Second
 
 // xkeenAvailable returns true when xkeen looks installed. We check for a
@@ -42,14 +43,11 @@ func runXKeen(arg string) (bool, string) {
 	if !xkeenAvailable() {
 		return true, "xkeen not installed; skipped (config still written)"
 	}
-	code, stderr, err := run(xkeenTimeout, XKeenBin, arg)
+	code, err := run(xkeenTimeout, XKeenBin, arg)
 	if err != nil {
 		return false, err.Error()
 	}
 	if code != 0 {
-		if msg := lastMeaningfulLine(stderr); msg != "" {
-			return false, msg
-		}
 		return false, fmt.Sprintf("xkeen exit %d", code)
 	}
 	return true, ""
@@ -58,69 +56,48 @@ func runXKeen(arg string) (bool, string) {
 // IsRunning is a best-effort check: is xray actually running right now?
 // Uses pidof from busybox-ash; pgrep would require the procps-ng opkg.
 func IsRunning() bool {
-	code, _, err := run(5*time.Second, "pidof", "xray")
+	code, err := run(5*time.Second, "pidof", "xray")
 	return err == nil && code == 0
 }
 
-// run executes cmd with stdio redirected and returns (exitCode, stderr, err).
+// run executes cmd with stdio fully discarded and returns (exitCode, err).
 //
-// Why we discard stdout: xkeen forks xray as a daemon, and xray inherits
-// xkeen's stdout. If we capture stdout via a pipe, exec.Cmd blocks until
-// xray exits — long after xkeen itself returned. Discarding stdout (which
-// xray then inherits) avoids the deadlock.
-func run(timeout time.Duration, name string, args ...string) (int, string, error) {
+// Stdio handling is load-bearing here. `xkeen -restart` forks `xray` as a
+// daemon — xray inherits xkeen's stdout/stderr file descriptors. If we
+// capture either into a Go io.Writer (string buffer, etc), Go internally
+// wires a pipe and a goroutine that drains the pipe until EOF. EOF only
+// happens when *all* write ends close — but xray is a long-running daemon
+// that keeps its inherited fds open forever. cmd.Wait() therefore blocks
+// indefinitely, leaking the apply worker.
+//
+// Even more subtle: when the context timeout fires, CommandContext sends
+// SIGKILL to xkeen (our direct child) but NOT to xray (which is already
+// orphaned to init). So even after timeout, the pipe stays open, cmd.Wait
+// stays blocked, and the goroutine that called run() is stuck. The next
+// call to Restart never gets to run.
+//
+// Both stdout and stderr must therefore be discarded to actual file
+// descriptors (Go's nil-Writer behavior → child fd dup'd to /dev/null),
+// not to in-process buffers. That breaks the inheritance chain.
+func run(timeout time.Duration, name string, args ...string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = nil
-	cmd.Stdout = nil
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
+	cmd.Stdout = nil // → /dev/null in child; no inherited pipe.
+	cmd.Stderr = nil // ditto. Diagnostic detail is lost, but daemon-leak protection wins.
 
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		return -1, stderr.String(), fmt.Errorf("timed out after %s", timeout)
+		return -1, fmt.Errorf("timed out after %s", timeout)
 	}
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode(), stderr.String(), nil
+			return exitErr.ExitCode(), nil
 		}
-		return -1, stderr.String(), err
+		return -1, err
 	}
-	return 0, stderr.String(), nil
+	return 0, nil
 }
 
-// lastMeaningfulLine picks the last non-empty line from xkeen's stderr,
-// stripping ANSI color codes that xkeen uses for progress output.
-func lastMeaningfulLine(text string) string {
-	text = stripANSI(text)
-	lines := strings.Split(text, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if s := strings.TrimSpace(lines[i]); s != "" {
-			return s
-		}
-	}
-	return ""
-}
-
-// stripANSI removes CSI SGR sequences (the most common ANSI escape kind:
-// ESC [ ... m). Sufficient for xkeen's colored output; we don't try to
-// handle every escape kind a terminal might emit.
-func stripANSI(s string) string {
-	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
-			j := i + 2
-			for j < len(s) && (s[j] >= 0x20 && s[j] < 0x40) {
-				j++
-			}
-			if j < len(s) && s[j] >= 0x40 && s[j] <= 0x7e {
-				i = j
-				continue
-			}
-		}
-		out = append(out, s[i])
-	}
-	return string(out)
-}

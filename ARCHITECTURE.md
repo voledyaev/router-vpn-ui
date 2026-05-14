@@ -69,32 +69,61 @@
 
 ### State — `data/state.json`
 
-Single source of truth for runtime config. Atomic write via `os.Rename()` from a `.tmp` sibling. Schema lives in `internal/state.Data`:
+Single source of truth for runtime config. Atomic write via `os.Rename()` from a `.tmp` sibling. Schema lives in `internal/state.Data` (current version: **v2**):
 
 ```jsonc
 {
-  "version": 1,
-  "subscription_url": "https://provider.example/connection/subs/UUID",
-  "subscription_fetched_at": "2026-05-15T12:00:00Z",
-  "servers": [
-    {"id": "pl.example:8443", "country": "PL", "name": "🇵🇱 Польша",
-     "host": "pl.example", "port": 8443, "uuid": "...",
-     "params": {"security": "reality", "type": "tcp",
-                "flow": "xtls-rprx-vision", "sni": "example.com",
-                "fp": "chrome", "pbk": "...", "sid": "..."}}
+  "version": 2,
+  "subscriptions": [
+    {
+      "id": "sub-1747269000-3a4f9b",        // stable, generated at add time
+      "label": "My provider",                // user-facing (auto-derived from host if empty)
+      "source": "https://provider.example/connection/subs/UUID",
+      "fetched_at": "2026-05-15T12:00:00Z",
+      "servers": [
+        {"id": "pl.example:8443", "country": "PL", "name": "🇵🇱 Польша",
+         "host": "pl.example", "port": 8443, "uuid": "...",
+         "params": {"security": "reality", "type": "tcp", "flow": "...",
+                    "sni": "...", "fp": "...", "pbk": "...", "sid": "..."}}
+      ]
+    },
+    {
+      "id": "sub-1747270500-c1e8d2",
+      "label": "Single endpoint",
+      "source": "vless://uuid@host.example:8443?security=reality#test",
+      "fetched_at": "2026-05-15T12:25:00Z",
+      "servers": [...]                       // parsed inline, no HTTP fetch
+    }
   ],
-  "active_server_id": "pl.example:8443",
+  "active_server": {                         // composite ref, nullable
+    "subscription_id": "sub-1747269000-3a4f9b",
+    "server_id": "pl.example:8443"
+  },
   "vpn_on": true,
   "rules_url": "https://gist.../xray-routing.json",
   "rules_fetched_at": "2026-05-15T12:05:00Z",
-  "rules": [...],         // []json.RawMessage — preserved bit-for-bit
+  "rules": [...],                            // []json.RawMessage, preserved bit-for-bit
   "rules_warnings": [],
   "rules_skipped_count": 0,
-  "last_error": ""
+  "last_error": "",
+  "last_apply": {                            // outcome of most recent apply cycle
+    "at": "2026-05-15T12:05:08Z",
+    "ok": true,
+    "msg": ""
+  },
+  "applying": false                          // true while applyLoop is mid-iteration
 }
 ```
 
+`last_apply` records the outcome of the most recent xkeen apply attempt and **persists across subsequent successes** — earlier we wiped `last_error` on the next OK apply, which hid transient failures from the UI. `applying` is a transient flag flipped on by the handler synchronously (so the very first response after a click already shows it) and cleared by the apply worker at the end of its iteration; the UI disables interactive controls while it's true.
+
+Each subscription has its own ID, label, source, fetched_at, and server list — there's no global flat server list. `active_server` is a composite (subscription_id, server_id) ref so deleting a subscription cleanly resets the active selection.
+
+A `source` starting with `vless://` is parsed in place (no HTTP fetch) — supports both subscription URLs and single inline links.
+
 `rules` is stored as `[]json.RawMessage` so user-supplied JSON survives save → reload without re-shaping. `rules_warnings` and `last_error` surface to the UI for transient failures.
+
+**Schema migration policy:** v1 → v2 is intentionally **not** migrated. A v1 state.json (with `subscription_url`/`servers`/`active_server_id` at top level) gets dropped at load time and the daemon starts with empty defaults. Single-user project; clean break beats migration code that would only run once.
 
 ### XKeen integration — `internal/xray`
 
@@ -168,19 +197,40 @@ All mutation endpoints follow the same shape: update state synchronously, ack th
 
 ```
 user clicks 🇩🇪 in UI
-  → POST /api/server  {"id": "de.example:8443"}
+  → POST /api/server  {"subscription_id": "sub-...", "server_id": "de.example:8443"}
   → Handler.postServer
-     → state.Update(d.ActiveServerID = "de.example:8443")  // atomic, persisted
-     → writeJSON(state.Snapshot())                          // ack browser
-     → requestApply()                                       // non-blocking signal
-  → UI re-renders status badge instantly
+     → state.Update(d.ActiveServer = &{sub_id, server_id})  // atomic, persisted
+     → respondAfterApply:
+        → state.Update(d.Applying = true)                    // synchronous, BEFORE response
+        → writeJSON(state.Snapshot())                        // ack browser; applying=true visible
+        → requestApply()                                     // non-blocking signal
+  → UI sees applying=true → disables tiles + toggle, shows "applying changes…"
 
 (meanwhile, in the applyLoop goroutine:)
   → regenerateAndRestart()
      → xray.WriteXKeenSplit(active, rules, cfgDir)
      → services.Restart()       (only if vpn_on=true)
-  → state.Update(d.LastError = "" or failure msg)
+  → state.Update(d.Applying = false, d.LastApply = {at, ok, msg}, d.LastError = …)
+
+UI polls /api/state every 1.5s while applying=true (10s otherwise),
+sees the flip, unfreezes controls, shows "last applied at HH:MM:SS".
 ```
+
+### Adding a subscription
+
+```
+user fills in label + source in "Add subscription" form
+  → POST /api/subscriptions  {"label": "Foo", "source": "https://..."  OR  "vless://..."}
+  → Handler.postAddSubscription
+     → if source starts with "vless://":  parse in place (no HTTP)
+       else:                              httpClient.GET(source)
+     → vless.ParseSubscription(raw) → []Server
+     → state.AddSubscription(label, source, servers)  // generates new ID
+     → writeJSON(state.Snapshot())
+  → UI renders the new card immediately
+```
+
+Adding a subscription doesn't touch xkeen — only changing the active server (or rules) does. No `requestApply` needed in this path.
 
 ### Refreshing rules
 
@@ -229,6 +279,7 @@ at runtime, every LAN client lookup:
 | Typed Go struct for state, no unknown-field passthrough | Cleaner than Python's `dict[str, Any]`; loss of forward-compat field preservation is irrelevant for a single-user hobby project. |
 | `json.RawMessage` for user rules | Lets us validate without re-shaping; user-supplied JSON survives save/load bit-for-bit. |
 | Async apply via single-worker goroutine | Decouples HTTP response from `xkeen -restart` (up to 90s with mid-flight iptables changes that tear down LAN TCP). Coalesces rapid toggles via buffered-1 channel; final intent always wins because the worker re-reads state on each iteration. |
+| Discard stdout AND stderr in `services.run` | `xkeen -restart` forks `xray` as a daemon. xray inherits the parent's stdio file descriptors. If we capture either into an in-process Writer (string buffer etc), Go wires a pipe + a drain goroutine — and `cmd.Wait()` blocks forever waiting for the pipe to EOF, which never happens because the daemon never closes its inherited fd. Worse: `CommandContext` SIGKILLs only our direct child (xkeen), not the orphaned xray, so even the timeout doesn't unblock us. The apply worker silently deadlocks on the first xkeen call and every subsequent click queues a signal that never gets drained. Discarding stdio breaks the inheritance chain. Trade-off: we lose xkeen's stderr for error messages, but the daemon-leak protection wins. See the load-bearing comment in `internal/services/services.go`. |
 | JSON file state, no DB | Trivial schema; atomic-write good enough; greppable. |
 | Alpine.js, no build step | No Node.js on router; CDN script is enough for this UI. |
 | Single static installer binary with embedded daemon | User downloads one file from Releases — no Python, no uv, no system deps, no `git clone`. |

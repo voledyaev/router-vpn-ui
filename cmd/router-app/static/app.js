@@ -1,37 +1,86 @@
 // Alpine.js component for yonder.
 //
 // Single state machine: keep the latest server-side state in `state`,
-// refetch after every mutation, surface transient `error` / `lastAction`.
+// refetch after every mutation, surface transient `error`.
 
 function vpnui() {
     return {
         // Server-side snapshot (null until first load)
         state: null,
 
-        // Onboarding form fields
-        subscriptionUrl: "",
-        rulesUrl: "",
+        // Add-subscription form fields
+        newSubLabel: "",
+        newSubSource: "",
+        showAddForm: false,
+
+        // Rules form (set-URL flow)
         newRulesUrl: "",
 
         // UI flags
         busy: false,
         error: "",
-        lastAction: "",
 
         // ---- Lifecycle ----
 
         init() {
             this.refresh();
-            // Light polling so manual changes (curl from another device) show up.
-            setInterval(() => { if (!this.busy) this.refresh(true); }, 10000);
+            // Adaptive polling. When the apply worker is active we want to
+            // see state.applying flip back to false as soon as possible
+            // (so the UI unfreezes); the rest of the time a relaxed
+            // cadence is fine for picking up changes from other clients.
+            this._pollTick();
+        },
+
+        _pollTick() {
+            const delay = (this.state && this.state.applying) ? 1500 : 10000;
+            setTimeout(async () => {
+                if (!this.busy) await this.refresh(true);
+                this._pollTick();
+            }, delay);
         },
 
         // ---- Computed ----
 
-        get activeServerName() {
-            if (!this.state || !this.state.active_server_id) return "";
-            const s = (this.state.servers || []).find(s => s.id === this.state.active_server_id);
-            return s ? s.name : this.state.active_server_id;
+        // True while either the local POST is in flight (`busy`) OR the
+        // apply worker on the server is running an xkeen restart. The
+        // latter makes the disabled state visible across browser tabs and
+        // for clients that didn't initiate the change.
+        get busyOrApplying() {
+            return this.busy || (this.state && this.state.applying);
+        },
+
+        get hasAnyServers() {
+            if (!this.state || !this.state.subscriptions) return false;
+            return this.state.subscriptions.some(s => s.servers.length > 0);
+        },
+
+        get activeServerLabel() {
+            const a = this.state && this.state.active_server;
+            if (!a) return "";
+            for (const sub of this.state.subscriptions || []) {
+                if (sub.id !== a.subscription_id) continue;
+                const srv = sub.servers.find(s => s.id === a.server_id);
+                if (srv) return `${srv.name} (${sub.label})`;
+            }
+            return `${a.server_id} (${a.subscription_id})`;
+        },
+
+        isActive(subId, srvId) {
+            const a = this.state && this.state.active_server;
+            return a && a.subscription_id === subId && a.server_id === srvId;
+        },
+
+        sourcePreview(s) {
+            if (!s) return "";
+            if (s.startsWith("vless://")) {
+                // Inline link — show a short, non-sensitive summary.
+                // (Full source is in the daemon's state but no need to splash UUID in the UI.)
+                const at = s.indexOf("@");
+                const hashOrQuery = Math.min(...[s.indexOf("?"), s.indexOf("#")].filter(i => i > 0).concat([s.length]));
+                const hostPart = at > 0 ? s.slice(at + 1, hashOrQuery) : s.slice(8, hashOrQuery);
+                return `inline vless://…@${hostPart}`;
+            }
+            return s.length > 80 ? s.slice(0, 77) + "…" : s;
         },
 
         // ---- API helpers ----
@@ -57,20 +106,17 @@ function vpnui() {
             }
         },
 
-        async _post(path, body) {
+        async _send(method, path, body) {
             this.busy = true;
             this.error = "";
-            this.lastAction = "";
             try {
-                const data = await this._fetchJson(path, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(body || {}),
-                });
+                const opts = { method };
+                if (body !== undefined && body !== null) {
+                    opts.headers = { "Content-Type": "application/json" };
+                    opts.body = JSON.stringify(body);
+                }
+                const data = await this._fetchJson(path, opts);
                 this.state = data;
-                this.lastAction = data.last_action || "";
-                // Auto-clear the success message after a few seconds.
-                if (this.lastAction) setTimeout(() => { this.lastAction = ""; }, 5000);
             } catch (e) {
                 this.error = e.message;
             } finally {
@@ -78,56 +124,78 @@ function vpnui() {
             }
         },
 
-        // ---- Actions ----
+        // ---- Actions: subscriptions ----
 
-        async submitSubscription() {
-            if (!this.subscriptionUrl) return;
-            await this._post("/api/subscription", { url: this.subscriptionUrl });
-            // After fetching servers, store the optional rules URL too.
-            if (!this.error && this.rulesUrl) {
-                await this._post("/api/rules-url", { url: this.rulesUrl });
+        async submitAddSubscription() {
+            const source = this.newSubSource.trim();
+            if (!source) return;
+            // Label is optional — backend derives a default from the source
+            // hostname if we send empty.
+            await this._send("POST", "/api/subscriptions",
+                { label: this.newSubLabel.trim(), source });
+            if (!this.error) {
+                this.newSubLabel = "";
+                this.newSubSource = "";
+                this.showAddForm = false;
+                // Auto-pick first server in the new subscription if nothing is
+                // selected yet — convenient onboarding.
+                if (this.state && !this.state.active_server) {
+                    const added = this.state.subscriptions[this.state.subscriptions.length - 1];
+                    if (added && added.servers.length > 0) {
+                        await this.pickServer(added.id, added.servers[0].id);
+                    }
+                }
             }
-            // Auto-pick first server so the user has something selected.
-            if (!this.error && this.state && this.state.servers.length > 0
-                && !this.state.active_server_id) {
-                await this._post("/api/server", { id: this.state.servers[0].id });
-            }
-            this.subscriptionUrl = "";
-            this.rulesUrl = "";
         },
 
-        async refreshSubscription() {
-            if (!this.state || !this.state.subscription_url) return;
-            await this._post("/api/subscription", { url: this.state.subscription_url });
+        cancelAddForm() {
+            this.showAddForm = false;
+            this.newSubLabel = "";
+            this.newSubSource = "";
+            this.error = "";
         },
 
-        async resetSubscription() {
-            if (!confirm("Replace the current subscription? This will clear all servers.")) return;
-            // Sending an empty/invalid URL won't help; instead we reset servers
-            // by going through the onboarding flow. Cheapest UX: clear active +
-            // ask user to paste a fresh URL via the onboarding screen.
-            // We do that by emptying servers via state — but the server doesn't
-            // have a "wipe" endpoint yet. Simpler: prompt for a new URL inline.
-            const url = prompt("New subscription URL:");
-            if (!url) return;
-            await this._post("/api/subscription", { url });
+        async refreshSubscription(id) {
+            await this._send("POST", `/api/subscriptions/${encodeURIComponent(id)}/refresh`);
         },
 
-        async pickServer(id) {
-            if (this.state && id === this.state.active_server_id) return;
-            await this._post("/api/server", { id });
+        async renameSubscription(sub) {
+            const next = window.prompt("New label:", sub.label);
+            if (!next || next.trim() === sub.label) return;
+            await this._send("PATCH", `/api/subscriptions/${encodeURIComponent(sub.id)}`,
+                { label: next.trim() });
+        },
+
+        async deleteSubscription(sub) {
+            const a = this.state.active_server;
+            const willClearActive = a && a.subscription_id === sub.id;
+            const warning = willClearActive
+                ? `Delete "${sub.label}"? VPN will turn off — the active server is in this subscription.`
+                : `Delete "${sub.label}"?`;
+            if (!window.confirm(warning)) return;
+            await this._send("DELETE", `/api/subscriptions/${encodeURIComponent(sub.id)}`);
+        },
+
+        // ---- Actions: server selection / VPN ----
+
+        async pickServer(subId, srvId) {
+            if (this.isActive(subId, srvId)) return;
+            await this._send("POST", "/api/server",
+                { subscription_id: subId, server_id: srvId });
         },
 
         async toggleVpn(on) {
-            await this._post("/api/toggle", { on });
+            await this._send("POST", "/api/toggle", { on });
         },
 
+        // ---- Actions: rules ----
+
         async setRulesUrl(url) {
-            await this._post("/api/rules-url", { url: url || null });
+            await this._send("POST", "/api/rules-url", { url: url || null });
         },
 
         async refreshRules() {
-            await this._post("/api/rules/refresh", {});
+            await this._send("POST", "/api/rules/refresh");
         },
 
         // ---- Utils ----

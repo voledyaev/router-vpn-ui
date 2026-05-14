@@ -15,10 +15,10 @@
     <header>
         <h1>yonder</h1>
         <div class="status" x-show="state">
-            <template x-if="!state || !state.servers || state.servers.length === 0">
+            <template x-if="!state || !hasAnyServers">
                 <span class="badge badge--neutral">setup needed</span>
             </template>
-            <template x-if="state && state.servers && state.servers.length > 0">
+            <template x-if="state && hasAnyServers">
                 <span :class="state.vpn_on ? 'badge badge--on' : 'badge badge--off'"
                       x-text="state.vpn_on ? 'on' : 'off'"></span>
             </template>
@@ -30,25 +30,25 @@
         <div class="card muted">loading…</div>
     </template>
 
-    <!-- Onboarding: no subscription yet -->
-    <template x-if="state && (!state.servers || state.servers.length === 0)">
+    <!-- Onboarding: no subscriptions yet -->
+    <template x-if="state && state.subscriptions && state.subscriptions.length === 0">
         <section class="card">
             <h2>Get started</h2>
-            <p class="muted">Paste your VLESS subscription URL. The router fetches it and lists the available country/server endpoints.</p>
-            <form @submit.prevent="submitSubscription()">
+            <p class="muted">Add your first VLESS subscription. Source can be an HTTP(S) URL to a subscription list, or a single <code>vless://</code> link pasted directly.</p>
+            <form @submit.prevent="submitAddSubscription()">
                 <label>
-                    Subscription URL
-                    <input type="url" x-model="subscriptionUrl"
-                           placeholder="https://provider.example/sub/UUID"
+                    Label <span class="muted">(optional — defaults to the source hostname)</span>
+                    <input type="text" x-model="newSubLabel"
+                           placeholder="A short name for this subscription"
+                           maxlength="100">
+                </label>
+                <label>
+                    Source
+                    <input type="text" x-model="newSubSource"
+                           placeholder="https://… subscription URL, or vless://… link pasted directly"
                            required>
                 </label>
-                <label>
-                    Routing rules URL <span class="muted">(optional)</span>
-                    <input type="url" x-model="rulesUrl"
-                           placeholder="https://gist.github.com/.../rules.json">
-                    <small class="muted">JSON in Xray's native routing format (<code>{"routing": {"rules": [...]}}</code> or just <code>[...]</code>). Each rule needs <code>outboundTag</code> = <code>direct</code>/<code>proxy</code>/<code>block</code>. Leave empty for the bundled default (everything through VPN, only local networks direct).</small>
-                </label>
-                <button type="submit" :disabled="busy">
+                <button type="submit" :disabled="busyOrApplying">
                     <span x-show="!busy">Connect</span>
                     <span x-show="busy">Fetching…</span>
                 </button>
@@ -57,8 +57,8 @@
         </section>
     </template>
 
-    <!-- Main: subscription configured -->
-    <template x-if="state && state.servers && state.servers.length > 0">
+    <!-- Main: at least one subscription configured -->
+    <template x-if="state && state.subscriptions && state.subscriptions.length > 0">
         <div>
 
             <!-- VPN toggle -->
@@ -66,80 +66,154 @@
                 <div class="row">
                     <div>
                         <h2 style="margin: 0">VPN</h2>
-                        <small class="muted" x-show="!state.active_server_id">no server selected</small>
-                        <small class="muted" x-show="state.active_server_id">
-                            via <strong x-text="activeServerName"></strong>
+                        <small class="muted" x-show="!state.active_server">no server selected</small>
+                        <small class="muted" x-show="state.active_server">
+                            via <strong x-text="activeServerLabel"></strong>
                         </small>
                     </div>
                     <label class="switch">
                         <input type="checkbox" :checked="state.vpn_on"
-                               :disabled="busy || (!state.active_server_id && !state.vpn_on)"
+                               :disabled="busyOrApplying || (!state.active_server && !state.vpn_on)"
                                @change="toggleVpn($event.target.checked)">
                         <span class="slider"></span>
                     </label>
                 </div>
-            </section>
 
-            <!-- Server picker -->
-            <section class="card">
-                <h2>Server</h2>
-                <div class="server-grid">
-                    <template x-for="srv in state.servers" :key="srv.id">
-                        <button type="button"
-                                class="server"
-                                :class="{ 'server--active': srv.id === state.active_server_id }"
-                                :disabled="busy"
-                                @click="pickServer(srv.id)">
-                            <span class="server__country" x-text="srv.country"></span>
-                            <span class="server__name" x-text="srv.name"></span>
-                            <span class="server__host muted" x-text="srv.host"></span>
-                        </button>
-                    </template>
-                </div>
-            </section>
+                <!-- "Applying…" indicator while xkeen restart is in flight.
+                     Backed by state.applying so it appears for ALL clients,
+                     not just the one that initiated the change. -->
+                <template x-if="state.applying">
+                    <small class="muted applying-indicator" style="display: block; margin-top: 0.5rem">
+                        applying changes — xkeen restarting…
+                    </small>
+                </template>
 
-            <!-- Subscription / rules / advanced -->
-            <section class="card">
-                <h2>Configuration</h2>
-                <dl class="kv">
-                    <dt>Subscription</dt>
-                    <dd>
-                        <code class="break" x-text="state.subscription_url"></code>
-                        <small class="muted">last fetched <span x-text="fmtTime(state.subscription_fetched_at)"></span></small>
-                        <div class="actions">
-                            <button type="button" class="btn-secondary" :disabled="busy" @click="refreshSubscription()">Refresh subscription</button>
-                            <button type="button" class="btn-secondary" :disabled="busy" @click="resetSubscription()">Replace…</button>
+                <!-- Last-apply result: persistent, doesn't get wiped by next success.
+                     Failure = red error block. Success = small muted footnote. -->
+                <template x-if="!state.applying && state.last_apply && !state.last_apply.ok">
+                    <div class="error" style="margin-top: 0.75rem">
+                        <strong>Apply failed</strong> at <span x-text="fmtTime(state.last_apply.at)"></span>:
+                        <span x-text="state.last_apply.msg || '(no message)'"></span>
+                        <div style="margin-top: 0.25rem; font-size: 0.85em; opacity: 0.85">
+                            xkeen could not start with the current configuration. Try a different server,
+                            or check that the proxy endpoint is reachable from the router.
                         </div>
-                    </dd>
+                    </div>
+                </template>
+                <template x-if="!state.applying && state.last_apply && state.last_apply.ok">
+                    <small class="muted" style="display: block; margin-top: 0.5rem">
+                        last applied <span x-text="fmtTime(state.last_apply.at)"></span>
+                    </small>
+                </template>
+            </section>
 
-                    <dt>Routing rules</dt>
-                    <dd>
-                        <template x-if="state.rules_url">
+            <!-- One card per subscription -->
+            <template x-for="sub in state.subscriptions" :key="sub.id">
+                <section class="card">
+                    <div class="row">
+                        <div>
+                            <h2 style="margin: 0" x-text="sub.label"></h2>
+                            <small class="muted">
+                                <span x-text="sub.servers.length"></span> server<span x-show="sub.servers.length !== 1">s</span>
+                                · last fetched <span x-text="fmtTime(sub.fetched_at)"></span>
+                            </small>
                             <div>
-                                <code class="break" x-text="state.rules_url"></code>
-                                <small class="muted">last fetched <span x-text="fmtTime(state.rules_fetched_at)"></span></small>
-                                <div class="actions">
-                                    <button type="button" class="btn-secondary" :disabled="busy" @click="refreshRules()">Refresh rules</button>
-                                    <button type="button" class="btn-secondary" :disabled="busy" @click="setRulesUrl(null)">Reset to default</button>
-                                </div>
+                                <small class="muted break" x-text="sourcePreview(sub.source)"></small>
                             </div>
-                        </template>
-                        <template x-if="!state.rules_url">
-                            <div>
-                                <small class="muted">Using bundled default: everything through VPN, only local networks direct. Set a custom URL (Xray-format JSON) to override.</small>
-                                <form @submit.prevent="setRulesUrl(newRulesUrl); newRulesUrl = ''" class="actions">
-                                    <input type="url" x-model="newRulesUrl"
-                                           placeholder="https://gist.github.com/.../rules.json"
-                                           style="flex: 1; min-width: 200px;">
-                                    <button type="submit" class="btn-secondary" :disabled="busy || !newRulesUrl">Set rules URL</button>
-                                </form>
-                            </div>
-                        </template>
-                    </dd>
-                </dl>
+                        </div>
+                    </div>
+
+                    <template x-if="sub.servers.length === 0">
+                        <p class="muted">No servers in this subscription. Refresh, or delete the entry.</p>
+                    </template>
+
+                    <template x-if="sub.servers.length > 0">
+                        <div class="server-grid">
+                            <template x-for="srv in sub.servers" :key="srv.id">
+                                <button type="button"
+                                        class="server"
+                                        :class="{ 'server--active': isActive(sub.id, srv.id) }"
+                                        :disabled="busyOrApplying"
+                                        @click="pickServer(sub.id, srv.id)">
+                                    <span class="server__country" x-text="srv.country"></span>
+                                    <span class="server__name" x-text="srv.name"></span>
+                                    <span class="server__host muted" x-text="srv.host"></span>
+                                </button>
+                            </template>
+                        </div>
+                    </template>
+
+                    <div class="actions">
+                        <button type="button" class="btn-secondary" :disabled="busyOrApplying"
+                                @click="refreshSubscription(sub.id)">Refresh</button>
+                        <button type="button" class="btn-secondary" :disabled="busyOrApplying"
+                                @click="renameSubscription(sub)">Rename</button>
+                        <button type="button" class="btn-secondary btn-danger" :disabled="busyOrApplying"
+                                @click="deleteSubscription(sub)">Delete</button>
+                    </div>
+                </section>
+            </template>
+
+            <!-- Add another subscription -->
+            <section class="card">
+                <template x-if="!showAddForm">
+                    <button type="button" class="btn-secondary" @click="showAddForm = true">+ Add subscription</button>
+                </template>
+                <template x-if="showAddForm">
+                    <form @submit.prevent="submitAddSubscription()">
+                        <h2 style="margin-top: 0">Add subscription</h2>
+                        <label>
+                            Label <span class="muted">(optional — defaults to the source hostname)</span>
+                            <input type="text" x-model="newSubLabel"
+                                   placeholder="A short name for this subscription"
+                                   maxlength="100">
+                        </label>
+                        <label>
+                            Source
+                            <input type="text" x-model="newSubSource"
+                                   placeholder="https://… subscription URL, or vless://… link pasted directly"
+                                   required>
+                        </label>
+                        <div class="actions">
+                            <button type="submit" :disabled="busyOrApplying">
+                                <span x-show="!busy">Add</span>
+                                <span x-show="busy">Fetching…</span>
+                            </button>
+                            <button type="button" class="btn-secondary"
+                                    @click="cancelAddForm()" :disabled="busy">Cancel</button>
+                        </div>
+                    </form>
+                </template>
+            </section>
+
+            <!-- Routing rules -->
+            <section class="card">
+                <h2>Routing rules</h2>
+                <template x-if="state.rules_url">
+                    <div>
+                        <code class="break" x-text="state.rules_url"></code>
+                        <small class="muted" style="display: block; margin-top: 0.25rem">
+                            last fetched <span x-text="fmtTime(state.rules_fetched_at)"></span>
+                        </small>
+                        <div class="actions">
+                            <button type="button" class="btn-secondary" :disabled="busyOrApplying" @click="refreshRules()">Refresh rules</button>
+                            <button type="button" class="btn-secondary" :disabled="busyOrApplying" @click="setRulesUrl(null)">Reset to default</button>
+                        </div>
+                    </div>
+                </template>
+                <template x-if="!state.rules_url">
+                    <div>
+                        <small class="muted">Using bundled default: everything through VPN, only local networks direct. Set a custom URL (Xray-format JSON) to override.</small>
+                        <form @submit.prevent="setRulesUrl(newRulesUrl); newRulesUrl = ''" class="actions">
+                            <input type="url" x-model="newRulesUrl"
+                                   placeholder="https://gist.github.com/.../rules.json"
+                                   style="flex: 1; min-width: 200px;">
+                            <button type="submit" class="btn-secondary" :disabled="busyOrApplying || !newRulesUrl">Set rules URL</button>
+                        </form>
+                    </div>
+                </template>
 
                 <div class="error" x-show="error" x-text="error"></div>
-                <div class="success" x-show="lastAction" x-text="lastAction"></div>
             </section>
 
         </div>
